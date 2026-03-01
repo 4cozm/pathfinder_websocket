@@ -310,6 +310,12 @@ class MapUpdate extends AbstractMessageComponent
                 // 이제 "새 세션"으로 바인딩
                 $conn->standaloneCid = $cid;
 
+                // 선택: load.uids가 있으면 Redis에 cid별 UID Set으로 upsert
+                $uids = $data['uids'] ?? null;
+                if (is_array($uids) && count($uids) > 0) {
+                    $this->standaloneUidsPersist($cid, $uids);
+                }
+
                 $this->wsSendJson($conn, [
                     'type'     => 'standalone.bound',
                     'ok'       => true,
@@ -1261,26 +1267,74 @@ class MapUpdate extends AbstractMessageComponent
         $conn->send($json);
     }
 
+    /** Standalone ticket TTL (seconds), Pathfinder Standalone::TICKET_TTL_SECONDS와 동일 */
+    private const STANDALONE_TICKET_TTL = 60;
+
     /**
-     * verify standalone ticket
+     * verify standalone ticket (서명된 티켓 우선, 실패 시 구 형식 파일 fallback)
      * @param string $ticket
      * @return array
      */
     private function standaloneTicketGet(string $ticket): array
     {
-        $dir = '/var/www/html/pathfinder/tmp/standalone_ticket';
-        $safe = preg_replace('/[^a-zA-Z0-9\-_]/', '', $ticket);
-        if ($safe === '') return ['ok' => false, 'code' => 'bad_ticket'];
-
-
-        $path = $dir . '/' . $safe;
-        if (!is_file($path)) return ['ok' => false, 'code' => 'ticket_not_found'];
-
-
-        $ttl = 60; // Standalone::TICKET_TTL_SECONDS와 맞춰라 (환경/상수로 가져와도 됨)
-        $mt  = @filemtime($path);
+        $ttl = self::STANDALONE_TICKET_TTL;
         $now = time();
 
+        // 서명된 티켓: payload_b64url.signature_b64url (점 하나로 2부분)
+        $dotPos = strpos($ticket, '.');
+        if ($dotPos !== false && $dotPos > 0 && $dotPos < strlen($ticket) - 1) {
+            $payloadB64 = substr($ticket, 0, $dotPos);
+            $sigB64 = substr($ticket, $dotPos + 1);
+            $payloadRaw = $this->standaloneB64UrlDecode($payloadB64);
+            $sigBin = $payloadRaw !== null ? $this->standaloneB64UrlDecode($sigB64) : null;
+            if ($payloadRaw !== null && $sigBin !== null) {
+                $parts = explode('.', $payloadRaw);
+                if (count($parts) === 4) {
+                    $cid = (int)$parts[0];
+                    $iat = (int)$parts[1];
+                    $exp = (int)$parts[2];
+                    $nonce = $parts[3];
+                    $secret = getenv('PF_STANDALONE_SECRET');
+                    if (!is_string($secret) || strlen($secret) < 16) {
+                        return ['ok' => false, 'code' => 'ticket_secret_not_configured'];
+                    }
+                    if ($cid <= 0 || $exp < $iat) {
+                        return ['ok' => false, 'code' => 'ticket_invalid'];
+                    }
+                    if ($now > $exp + 2) {
+                        return ['ok' => false, 'code' => 'ticket_expired'];
+                    }
+                    if (!hash_equals($this->standaloneB64UrlEncode(hash_hmac('sha256', $payloadRaw, $secret, true)), $sigB64)) {
+                        return ['ok' => false, 'code' => 'ticket_signature_invalid'];
+                    }
+                    $nonceDir = '/var/www/html/pathfinder/tmp/standalone_ticket_nonce';
+                    if (!is_dir($nonceDir)) {
+                        @mkdir($nonceDir, 0777, true);
+                    }
+                    $safeNonce = preg_replace('/[^a-zA-Z0-9\-_]/', '', $nonce);
+                    if ($safeNonce !== '') {
+                        $noncePath = $nonceDir . '/' . $safeNonce;
+                        if (is_file($noncePath)) {
+                            return ['ok' => false, 'code' => 'ticket_already_used'];
+                        }
+                        @touch($noncePath);
+                        return ['ok' => true, 'cid' => $cid, 'ttl' => $ttl, 'ts' => $iat];
+                    }
+                }
+            }
+        }
+
+        // 구 형식: standalone_ticket 디렉터리 파일 조회
+        $dir = '/var/www/html/pathfinder/tmp/standalone_ticket';
+        $safe = preg_replace('/[^a-zA-Z0-9\-_]/', '', $ticket);
+        if ($safe === '') {
+            return ['ok' => false, 'code' => 'bad_ticket'];
+        }
+        $path = $dir . '/' . $safe;
+        if (!is_file($path)) {
+            return ['ok' => false, 'code' => 'ticket_not_found'];
+        }
+        $mt = @filemtime($path);
         if (!$mt) {
             @unlink($path);
             return ['ok' => false, 'code' => 'ticket_invalid_mtime'];
@@ -1289,31 +1343,69 @@ class MapUpdate extends AbstractMessageComponent
             @unlink($path);
             return ['ok' => false, 'code' => 'ticket_expired'];
         }
-
         $raw = @file_get_contents($path);
         if ($raw === false || trim($raw) === '') {
             @unlink($path);
             return ['ok' => false, 'code' => 'ticket_read_fail'];
         }
-
         $parts = explode('.', trim($raw));
         if (count($parts) < 2) {
             @unlink($path);
             return ['ok' => false, 'code' => 'ticket_corrupt'];
         }
-
         $cid = (int)$parts[0];
-        $ts  = (int)$parts[1];
-
+        $ts = (int)$parts[1];
         if ($cid <= 0 || $ts <= 0) {
             @unlink($path);
             return ['ok' => false, 'code' => 'ticket_invalid'];
         }
-
-
         @unlink($path);
-
         return ['ok' => true, 'cid' => $cid, 'ttl' => $ttl, 'ts' => $ts];
+    }
+
+    private function standaloneB64UrlDecode(string $s): ?string
+    {
+        $b64 = strtr($s, '-_', '+/');
+        $pad = strlen($b64) % 4;
+        if ($pad) {
+            $b64 .= str_repeat('=', 4 - $pad);
+        }
+        $out = base64_decode($b64, true);
+        return $out === false ? null : $out;
+    }
+
+    private function standaloneB64UrlEncode(string $bin): string
+    {
+        return rtrim(strtr(base64_encode($bin), '+/', '-_'), '=');
+    }
+
+    /**
+     * Redis에 standalone:uids:{cid} Set으로 UID 목록 upsert (SADD)
+     * REDIS_DSN 환경변수 없으면 스킵 (예: tcp://host:6379 또는 redis://...)
+     */
+    private function standaloneUidsPersist(int $cid, array $uids): void
+    {
+        $dsn = getenv('REDIS_DSN');
+        if (!is_string($dsn) || $dsn === '') {
+            return;
+        }
+        try {
+            $client = new \Predis\Client($dsn);
+            $key = 'standalone:uids:' . $cid;
+            $members = [];
+            foreach ($uids as $uid) {
+                $v = is_scalar($uid) ? (string)$uid : null;
+                if ($v !== null && $v !== '') {
+                    $members[] = $v;
+                }
+            }
+            if (count($members) > 0) {
+                $client->sadd($key, ...$members);
+            }
+        } catch (\Throwable $e) {
+            // 로그만 (바인딩은 성공한 상태로 둠)
+            error_log('[WS] standalone UIDs persist failed: ' . $e->getMessage());
+        }
     }
 
     /**
