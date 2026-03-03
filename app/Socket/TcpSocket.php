@@ -288,6 +288,7 @@ class TcpSocket extends AbstractSocket{
             case 'mapUpdate':
             case 'mapDeleted':
             case 'logData':
+            case 'combatAggregationStart':
                 if(method_exists($this->handler, 'receiveData')){
                     $this->log(['info'], $connection, __FUNCTION__, 'task "' . $task . '" processing…');
 
@@ -532,8 +533,20 @@ class TcpSocket extends AbstractSocket{
     protected function getStats() : array {
         return [
             'tcpSocket' => $this->getSocketStats(),
-            'webSocket' => $this->handler->getSocketStats()
+            'webSocket' => $this->getHandlerWebSocketStats()
         ];
+    }
+
+    /**
+     * @return array handler가 getSocketStats()를 가지면 해당 반환값, 아니면 빈 배열
+     */
+    private function getHandlerWebSocketStats() : array {
+        if (!method_exists($this->handler, 'getSocketStats')) {
+            return [];
+        }
+        /** @var \Exodus4D\Socket\Component\AbstractMessageComponent $handler */
+        $handler = $this->handler;
+        return $handler->getSocketStats();
     }
 
     /**

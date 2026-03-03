@@ -310,6 +310,12 @@ class MapUpdate extends AbstractMessageComponent
                 // 이제 "새 세션"으로 바인딩
                 $conn->standaloneCid = $cid;
 
+                // DPoP JKT 바인딩 (재발급 시 cnf.jkt에 사용)
+                $jwk = $data['jwk'] ?? null;
+                if (is_array($jwk)) {
+                    $conn->standaloneJkt = $this->standaloneJwkThumbprint($jwk);
+                }
+
                 // 선택: load.uids가 있으면 Redis에 cid별 UID Set으로 upsert
                 $uids = $data['uids'] ?? null;
                 if (is_array($uids) && count($uids) > 0) {
@@ -484,6 +490,57 @@ class MapUpdate extends AbstractMessageComponent
                     'remove'   => count($toRemove),
                     'maps'     => 1,
                     'serverTs' => time(),
+                ]);
+                break;
+            case 'standalone.token':
+                if (!isset($conn->standaloneCid)) {
+                    $this->wsSendJson($conn, ['type' => 'standalone.token', 'ok' => false, 'code' => 'not_bound']);
+                    break;
+                }
+
+                $data = (array)$payload->load;
+                $jwk = $data['jwk'] ?? null;
+                $jkt = null;
+                if (is_array($jwk)) {
+                    $jkt = $this->standaloneJwkThumbprint($jwk);
+                    $conn->standaloneJkt = $jkt; // 갱신
+                } else {
+                    $jkt = $conn->standaloneJkt ?? null;
+                }
+
+                if (!$jkt) {
+                    $this->wsSendJson($conn, ['type' => 'standalone.token', 'ok' => false, 'code' => 'missing_jwk']);
+                    break;
+                }
+
+                $pingSecret = (string)getenv('PF_PING_JWT_SECRET');
+                if (strlen($pingSecret) < 32) {
+                    $this->wsSendJson($conn, ['type' => 'standalone.token', 'ok' => false, 'code' => 'server_config_error']);
+                    break;
+                }
+
+                $cid = (int)$conn->standaloneCid;
+                $pingExpSec = 60 * 60 * 12; // 12h
+                $iat = time();
+                $exp = $iat + $pingExpSec;
+
+                $pingToken = $this->standaloneJwtHs256([
+                    'iss'   => 'pathfinder',
+                    'aud'   => 'ping-api',
+                    'sub'   => (string)$cid,
+                    'cid'   => $cid,
+                    'iat'   => $iat,
+                    'exp'   => $exp,
+                    'scope' => 'discord:ping',
+                    'cnf'   => ['jkt' => $jkt],
+                ], $pingSecret);
+
+                $this->wsSendJson($conn, [
+                    'type'         => 'standalone.token',
+                    'ok'           => true,
+                    'access_token' => $pingToken,
+                    'expires_in'   => $pingExpSec,
+                    'serverTs'     => $iat,
                 ]);
                 break;
             case 'subscribe':
@@ -939,9 +996,55 @@ class MapUpdate extends AbstractMessageComponent
             case 'logData':
                 $this->handleLogData((array)$load['meta'], (array)$load['log']);
                 break;
+            case 'combatAggregationStart':
+                $this->broadcastCombatAggregationStart(is_array($load) ? $load : []);
+                break;
         }
 
         return $responseLoad;
+    }
+
+    /**
+     * standalone으로 바인딩된 연결 전체에 combatAggregation.start 브로드캐스트.
+     * 페이로드: requestId, startTime, endTime (한국시간 KST 기준). 클라이언트는 이 범위 내 로그만 수집.
+     */
+    private function broadcastCombatAggregationStart(array $load): void
+    {
+        $requestId = $load['requestId'] ?? '';
+        $startTime = $load['startTime'] ?? null;
+        $endTime = $load['endTime'] ?? null;
+        if ($requestId === '') {
+            return;
+        }
+        $connections = $this->getStandaloneConnections();
+        $msg = [
+            'type'      => 'combatAggregation.start',
+            'requestId' => $requestId,
+            'startTime' => $startTime,
+            'endTime'   => $endTime,
+        ];
+        foreach ($connections as $conn) {
+            $this->wsSendJson($conn, $msg);
+        }
+    }
+
+    /**
+     * standalone 바인딩된 모든 연결 (characters에 등록된 conn) 수집.
+     */
+    private function getStandaloneConnections(): \SplObjectStorage
+    {
+        $connections = new \SplObjectStorage();
+        foreach ($this->characters as $resourceIds) {
+            if (!is_array($resourceIds)) {
+                continue;
+            }
+            foreach ($resourceIds as $conn) {
+                if ($conn instanceof ConnectionInterface && !$connections->contains($conn)) {
+                    $connections->attach($conn);
+                }
+            }
+        }
+        return $connections;
     }
 
     /**
@@ -1472,5 +1575,24 @@ class MapUpdate extends AbstractMessageComponent
 
         // UI 갱신
         $this->broadcastMapSubscriptions([$mapId]);
+    }
+
+    private function standaloneJwkThumbprint(array $jwk): string
+    {
+        $canonical = json_encode([
+            'crv' => $jwk['crv'],
+            'kty' => $jwk['kty'],
+            'x'   => $jwk['x'],
+            'y'   => $jwk['y'],
+        ]);
+        return $this->standaloneB64UrlEncode(hash('sha256', $canonical, true));
+    }
+
+    private function standaloneJwtHs256(array $claims, string $secret): string
+    {
+        $header = $this->standaloneB64UrlEncode(json_encode(['typ' => 'JWT', 'alg' => 'HS256']));
+        $payload = $this->standaloneB64UrlEncode(json_encode($claims));
+        $sig = $this->standaloneB64UrlEncode(hash_hmac('sha256', $header . '.' . $payload, $secret, true));
+        return $header . '.' . $payload . '.' . $sig;
     }
 }
