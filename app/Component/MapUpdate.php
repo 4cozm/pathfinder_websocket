@@ -262,6 +262,19 @@ class MapUpdate extends AbstractMessageComponent
                     break;
                 }
 
+                $clientVersion = (string)($data['version'] ?? '1.0.0');
+                $minVersion = \Cache::instance()->get('dmchelper_min_version') ?: '1.0.0';
+                if ($minVersion && version_compare($clientVersion, $minVersion, '<')) {
+                    $this->wsSendJson($conn, [
+                        'type' => 'standalone.bound',
+                        'ok'   => false,
+                        'code' => 'version_mismatch',
+                    ]);
+                    // 버전 불일치 시 연결 종료
+                    $conn->close();
+                    break;
+                }
+
                 $v = $this->standaloneTicketGet($ticket);
                 if (!$v['ok']) {
                     $this->wsSendJson($conn, [
