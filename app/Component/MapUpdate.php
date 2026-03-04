@@ -158,6 +158,13 @@ class MapUpdate extends AbstractMessageComponent
     protected $characterData;
 
     /**
+     * 웹 브라우저 WS 연결 목록 (standalone.bind를 하지 않은 일반 브라우저 클라이언트)
+     * Toast 브로드캐스트 대상
+     * @var \SplObjectStorage
+     */
+    protected $browserConnections;
+
+    /**
      * MapUpdate constructor.
      * @param Store $store
      */
@@ -170,6 +177,7 @@ class MapUpdate extends AbstractMessageComponent
         $this->characters           = [];
         $this->subscriptions        = [];
         $this->characterData        = [];
+        $this->browserConnections   = new \SplObjectStorage();
     }
 
     /**
@@ -187,6 +195,11 @@ class MapUpdate extends AbstractMessageComponent
         ]);
 
         error_log("[WS] onOpen hello sent");
+
+        // 모든 신규 연결을 브라우저 연결로 우선 추적
+        // standalone.bind 성공 시에는 제거하지 않음 — standalone은 별도 $characters로 관리
+        $this->browserConnections->attach($conn);
+
         parent::onOpen($conn);
     }
 
@@ -196,6 +209,11 @@ class MapUpdate extends AbstractMessageComponent
     public function onClose(ConnectionInterface $conn)
     {
         parent::onClose($conn);
+
+        // 브라우저 연결 목록에서 제거
+        if ($this->browserConnections->contains($conn)) {
+            $this->browserConnections->detach($conn);
+        }
 
         $this->unSubscribeConnection($conn);
     }
@@ -329,6 +347,10 @@ class MapUpdate extends AbstractMessageComponent
                     'ttl'      => (int)$v['ttl'],
                     'serverTs' => time(),
                 ]);
+
+                // bind 성공 — Redis에서 미완료 dmc 작업을 1회 전달
+                $this->sendPendingDmcTasks($conn);
+
                 break;
             case 'standalone.heartbeat':
                 $data = (array)$payload->load;
@@ -1006,26 +1028,34 @@ class MapUpdate extends AbstractMessageComponent
 
     /**
      * standalone으로 바인딩된 연결 전체에 combatAggregation.start 브로드캐스트.
-     * 페이로드: requestId, startTime, endTime (한국시간 KST 기준). 클라이언트는 이 범위 내 로그만 수집.
+     * 웹 브라우저 연결에는 combatAggregation.toast 브로드캐스트 (페이로드에 expiresIn 포함).
+     * 페이로드: requestId, startTime, endTime (KST 기준). 클라이언트는 이 범위 내 로그만 수집.
      */
     private function broadcastCombatAggregationStart(array $load): void
     {
         $requestId = $load['requestId'] ?? '';
         $startTime = $load['startTime'] ?? null;
-        $endTime = $load['endTime'] ?? null;
+        $endTime   = $load['endTime']   ?? null;
         if ($requestId === '') {
             return;
         }
-        $connections = $this->getStandaloneConnections();
-        $msg = [
+
+        // (A) dmc_helper standalone WS — 만료시간 미전달, 즉시 실행
+        $standaloneConns = $this->getStandaloneConnections();
+        $standaloneMsg = [
             'type'      => 'combatAggregation.start',
             'requestId' => $requestId,
             'startTime' => $startTime,
             'endTime'   => $endTime,
         ];
-        foreach ($connections as $conn) {
-            $this->wsSendJson($conn, $msg);
+        foreach ($standaloneConns as $conn) {
+            error_log("[WS][combatAgg] standalone start -> rid=" . $conn->resourceId);
+            $this->wsSendJson($conn, $standaloneMsg);
         }
+        error_log("[WS][combatAgg] standalone broadcast count=" . count($standaloneConns));
+
+        // (B) 웹 브라우저 WS — Toast 안내 메시지 (expiresIn 포함)
+        $this->broadcastToastToAllBrowsers($requestId);
     }
 
     /**
@@ -1594,5 +1624,103 @@ class MapUpdate extends AbstractMessageComponent
         $payload = $this->standaloneB64UrlEncode(json_encode($claims));
         $sig = $this->standaloneB64UrlEncode(hash_hmac('sha256', $header . '.' . $payload, $secret, true));
         return $header . '.' . $payload . '.' . $sig;
+    }
+
+    // ================================================================================================================
+    // Combat Aggregation helpers
+    // ================================================================================================================
+
+    /**
+     * 모든 브라우저 WS(standalone 아닌) 에 combatAggregation.toast 전송.
+     * expiresIn은 Redis에서 남은 TTL을 조회해 포함.
+     */
+    private function broadcastToastToAllBrowsers(string $requestId): void
+    {
+        if (!isset($this->browserConnections) || count($this->browserConnections) === 0) {
+            return;
+        }
+
+        $expiresIn = 300; // 기본값
+        try {
+            $redis = $this->getRedisClient();
+            if ($redis !== null) {
+                $ttl = $redis->ttl('dmc_tasks:' . $requestId);
+                if (is_int($ttl) && $ttl > 0) {
+                    $expiresIn = $ttl;
+                }
+            }
+        } catch (\Throwable $e) {
+            // TTL 조회 실패 시 기본값 사용
+        }
+
+        $toastMsg = [
+            'type'      => 'combatAggregation.toast',
+            'requestId' => $requestId,
+            'expiresIn' => $expiresIn,
+        ];
+
+        $count = 0;
+        foreach ($this->browserConnections as $conn) {
+            $this->wsSendJson($conn, $toastMsg);
+            $count++;
+        }
+        error_log("[WS][combatAgg] browser toast broadcast count=" . $count);
+    }
+
+    /**
+     * standalone.bind 성공 직후 Redis의 활성 dmc 작업을 조회해 해당 conn에 1회 전송.
+     * 만료된 키는 active SET에서 제거.
+     */
+    private function sendPendingDmcTasks(ConnectionInterface $conn): void
+    {
+        try {
+            $redis = $this->getRedisClient();
+            if ($redis === null) {
+                return;
+            }
+
+            $members = $redis->smembers('dmc_tasks:active');
+            if (empty($members)) {
+                return;
+            }
+
+            foreach ($members as $requestId) {
+                $requestId = (string)$requestId;
+                $taskJson  = $redis->get('dmc_tasks:' . $requestId);
+
+                if ($taskJson === null) {
+                    // TTL 만료 — active SET에서 제거
+                    $redis->srem('dmc_tasks:active', $requestId);
+                    continue;
+                }
+
+                $task = json_decode($taskJson, true);
+                if (!is_array($task)) {
+                    continue;
+                }
+
+                error_log("[WS][combatAgg] sendPendingDmcTasks -> rid=" . $conn->resourceId . " requestId=" . $requestId);
+                $this->wsSendJson($conn, [
+                    'type'      => 'combatAggregation.start',
+                    'requestId' => $requestId,
+                    'startTime' => $task['startTime'] ?? null,
+                    'endTime'   => $task['endTime']   ?? null,
+                ]);
+            }
+        } catch (\Throwable $e) {
+            error_log('[WS] sendPendingDmcTasks failed: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * Predis 클라이언트 반환. REDIS_DSN 환경변수 없거나 연결 실패 시 null.
+     */
+    private function getRedisClient(): ?\Predis\Client
+    {
+        $dsn = (string)getenv('REDIS_DSN');
+        if ($dsn === '') {
+            return null;
+        }
+        return new \Predis\Client($dsn);
     }
 }
