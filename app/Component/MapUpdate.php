@@ -347,10 +347,10 @@ class MapUpdate extends AbstractMessageComponent
                     $conn->standaloneJkt = $this->standaloneJwkThumbprint($jwk);
                 }
 
-                // 선택: load.uids가 있으면 Redis에 cid별 UID Set으로 upsert
+                // 유저 관계도: load.uids가 있으면 MariaDB standalone_detect_characters + standalone_detect_log에 upsert
                 $uids = $data['uids'] ?? null;
                 if (is_array($uids) && count($uids) > 0) {
-                    $this->standaloneUidsPersist($cid, $uids);
+                    $this->standaloneDetectPersist($cid, $uids);
                 }
 
                 $this->wsSendJson($conn, [
@@ -1526,31 +1526,57 @@ class MapUpdate extends AbstractMessageComponent
     }
 
     /**
-     * Redis에 standalone:uids:{cid} Set으로 UID 목록 upsert (SADD)
-     * REDIS_DSN 환경변수 없으면 스킵 (예: tcp://host:6379 또는 redis://...)
+     * MariaDB pathfinder: standalone_detect_characters에 캐릭터 ID upsert + standalone_detect_log에 (발급자, 발견 캐릭터) 관계 저장.
+     * name/corporation_* 는 덮어쓰지 않고 updated_at만 갱신.
+     * MYSQL_HOST, MYSQL_PF_DB_NAME, MYSQL_USER, MYSQL_PASSWORD 환경변수 사용.
+     *
+     * @param int $issuerCid 티켓 발급한 캐릭터 ID (맵에서 "다클라 헬퍼" 누른 계정)
+     * @param array $uids bind load.uids에서 수집된 캐릭터 ID 목록
      */
-    private function standaloneUidsPersist(int $cid, array $uids): void
+    private function standaloneDetectPersist(int $issuerCid, array $uids): void
     {
-        $dsn = getenv('REDIS_DSN');
-        if (!is_string($dsn) || $dsn === '') {
+        $host = getenv('MYSQL_HOST');
+        $dbname = getenv('MYSQL_PF_DB_NAME');
+        $user = getenv('MYSQL_USER');
+        $pass = getenv('MYSQL_PASSWORD');
+        $port = getenv('MYSQL_PORT') ?: '3306';
+        if (!is_string($host) || $host === '' || !is_string($dbname) || $dbname === '') {
+            return;
+        }
+        if ($issuerCid <= 0) {
+            return;
+        }
+        $characterIds = [];
+        foreach ($uids as $uid) {
+            $v = is_scalar($uid) ? (string)$uid : null;
+            if ($v !== null && $v !== '' && ctype_digit($v)) {
+                $characterIds[] = (int)$v;
+            }
+        }
+        if (count($characterIds) === 0) {
             return;
         }
         try {
-            $client = new \Predis\Client($dsn);
-            $key = 'standalone:uids:' . $cid;
-            $members = [];
-            foreach ($uids as $uid) {
-                $v = is_scalar($uid) ? (string)$uid : null;
-                if ($v !== null && $v !== '') {
-                    $members[] = $v;
-                }
+            $dsn = sprintf('mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4', $host, $port, $dbname);
+            $pdo = new \PDO($dsn, (string)$user, (string)$pass, [
+                \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+            ]);
+            $stmtChars = $pdo->prepare(
+                'INSERT INTO standalone_detect_characters (character_id, updated_at) VALUES (?, NOW()) ' .
+                'ON DUPLICATE KEY UPDATE updated_at = NOW()'
+            );
+            foreach ($characterIds as $detectedCid) {
+                $stmtChars->execute([$detectedCid]);
             }
-            if (count($members) > 0) {
-                $client->sadd($key, ...$members);
+            $stmtLog = $pdo->prepare(
+                'INSERT INTO standalone_detect_log (issuer_character_id, detected_character_id, updated_at) VALUES (?, ?, NOW()) ' .
+                'ON DUPLICATE KEY UPDATE updated_at = NOW()'
+            );
+            foreach ($characterIds as $detectedCid) {
+                $stmtLog->execute([$issuerCid, $detectedCid]);
             }
         } catch (\Throwable $e) {
-            // 로그만 (바인딩은 성공한 상태로 둠)
-            error_log('[WS] standalone UIDs persist failed: ' . $e->getMessage());
+            error_log('[WS] standalone_detect persist failed: ' . $e->getMessage());
         }
     }
 
