@@ -1541,6 +1541,7 @@ class MapUpdate extends AbstractMessageComponent
         $pass = getenv('MYSQL_PASSWORD');
         $port = getenv('MYSQL_PORT') ?: '3306';
         if (!is_string($host) || $host === '' || !is_string($dbname) || $dbname === '') {
+            error_log('[WS] standalone_detect persist skipped: MYSQL_HOST or MYSQL_PF_DB_NAME empty (check pf-socket env)');
             return;
         }
         if ($issuerCid <= 0) {
@@ -1575,6 +1576,7 @@ class MapUpdate extends AbstractMessageComponent
             foreach ($characterIds as $detectedCid) {
                 $stmtLog->execute([$issuerCid, $detectedCid]);
             }
+            error_log('[WS] standalone_detect persist ok: issuer=' . $issuerCid . ' count=' . count($characterIds));
         } catch (\Throwable $e) {
             error_log('[WS] standalone_detect persist failed: ' . $e->getMessage());
         }
