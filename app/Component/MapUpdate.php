@@ -427,7 +427,24 @@ class MapUpdate extends AbstractMessageComponent
                 $existing = $this->getCharacterIdsByConnection($conn);
                 $desired  = array_keys($incoming);
 
-                $toAdd    = array_values(array_diff($desired, $existing));
+                // ✅ DB 검증 (신규 추가되는 캐릭터에 한해)
+                $toAddRaw = array_values(array_diff($desired, $existing));
+                $rejected = [];
+                $toAdd    = [];
+
+                if (count($toAddRaw) > 0) {
+                    $validIds = $this->standaloneCheckCharactersExist($toAddRaw);
+                    foreach ($toAddRaw as $cid) {
+                        if (in_array((int)$cid, $validIds, true)) {
+                            $toAdd[] = (int)$cid;
+                        } else {
+                            $rejected[] = (int)$cid;
+                        }
+                    }
+                }
+
+                // 거절된 캐릭터는 이후 추가/갱신 대상에서 제외
+                $desired  = array_values(array_diff($desired, $rejected));
                 $toRemove = array_values(array_diff($existing, $desired));
 
                 // ✅ TTL 갱신(Lease)
@@ -521,9 +538,10 @@ class MapUpdate extends AbstractMessageComponent
                     'ok'       => true,
                     'cid'      => (int)$conn->standaloneCid,
                     'mapId'    => $mapId,
-                    'received' => count($desired),
+                    'received' => count($incoming),
                     'add'      => count($toAdd),
                     'remove'   => count($toRemove),
+                    'rejected' => $rejected,
                     'maps'     => 1,
                     'serverTs' => time(),
                 ]);
@@ -1580,6 +1598,50 @@ class MapUpdate extends AbstractMessageComponent
             error_log('[WS] standalone_detect persist ok: issuer=' . $issuerCid . ' count=' . count($characterIds));
         } catch (\Throwable $e) {
             error_log('[WS] standalone_detect persist failed: ' . $e->getMessage());
+        }
+    }
+
+    private function standaloneCheckCharactersExist(array $cids): array
+    {
+        $host = getenv('MYSQL_HOST');
+        $dbname = getenv('MYSQL_PF_DB_NAME');
+        $user = getenv('MYSQL_USER');
+        $pass = getenv('MYSQL_PASSWORD');
+        $port = getenv('MYSQL_PORT') ?: '3306';
+        if (!is_string($host) || $host === '' || !is_string($dbname) || $dbname === '') {
+            error_log('[WS] standalone check skipped: MYSQL_HOST or MYSQL_PF_DB_NAME empty');
+            return $cids;
+        }
+
+        $validCids = [];
+        foreach ($cids as $cid) {
+            $v = is_scalar($cid) ? (string)$cid : null;
+            if ($v !== null && $v !== '' && ctype_digit($v)) {
+                $validCids[] = (int)$v;
+            }
+        }
+        if (count($validCids) === 0) {
+            return [];
+        }
+
+        try {
+            $dsn = sprintf('mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4', $host, $port, $dbname);
+            $pdo = new \PDO($dsn, (string)$user, (string)$pass, [
+                \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+            ]);
+            $inQuery = implode(',', array_fill(0, count($validCids), '?'));
+            $stmt = $pdo->prepare("SELECT id FROM `character` WHERE id IN ($inQuery)");
+            $stmt->execute($validCids);
+            
+            $existingRows = $stmt->fetchAll(\PDO::FETCH_COLUMN);
+            $existing = [];
+            foreach ($existingRows as $row) {
+                $existing[] = (int)$row;
+            }
+            return $existing;
+        } catch (\Throwable $e) {
+            error_log('[WS] standalone check failed: ' . $e->getMessage());
+            return $validCids; // fallback to allow all
         }
     }
 
