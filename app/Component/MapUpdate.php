@@ -263,8 +263,9 @@ class MapUpdate extends AbstractMessageComponent
                 }
 
                 $clientVersion = (string)($data['version'] ?? '1.0.0');
-                $minVersion = \Cache::instance()->get('dmchelper_min_version') ?: '1.0.0';
-                if ($minVersion && version_compare($clientVersion, $minVersion, '<')) {
+                // 단일 소스: Redis 키 dmchelper_min_version (Pathfinder Cache와 동일 백엔드). env로 오버라이드 가능.
+                $minVersion = $this->getDmchelperMinVersion();
+                if ($minVersion !== '' && version_compare($clientVersion, $minVersion, '<')) {
                     $this->wsSendJson($conn, [
                         'type' => 'standalone.bound',
                         'ok'   => false,
@@ -1751,6 +1752,42 @@ class MapUpdate extends AbstractMessageComponent
         } catch (\Throwable $e) {
             error_log('[WS] sendPendingDmcTasks failed: ' . $e->getMessage());
         }
+    }
+
+    /** Redis 키: Pathfinder Cache::set('dmchelper_min_version', $v) 와 동일 키로 단일 소스 유지 */
+    private const DMCHELPER_MIN_VERSION_REDIS_KEY = 'dmchelper_min_version';
+
+    /**
+     * dmc_helper 최소 버전 조회. 단일 소스 = Redis (Pathfinder CACHE 백엔드와 동일).
+     * - env DMCHELPER_MIN_VERSION 있으면 우선 사용(오버라이드).
+     * - 없으면 Redis 키 dmchelper_min_version 조회 (Pathfinder가 Cache::instance()->set() 로 넣은 값).
+     * - F3 Redis 백엔드는 값을 serialize할 수 있으므로 직렬화 문자열도 해석.
+     * - 빈 문자열이면 버전 검사 생략.
+     */
+    private function getDmchelperMinVersion(): string
+    {
+        $env = getenv('DMCHELPER_MIN_VERSION');
+        if ($env !== false && $env !== '') {
+            return trim((string)$env);
+        }
+        $redis = $this->getRedisClient();
+        if ($redis === null) {
+            return '';
+        }
+        try {
+            $raw = $redis->get(self::DMCHELPER_MIN_VERSION_REDIS_KEY);
+        } catch (\Throwable $e) {
+            return '';
+        }
+        if ($raw === null || $raw === '') {
+            return '';
+        }
+        $raw = (string)$raw;
+        // F3 Cache Redis 백엔드가 PHP serialize() 사용 시 (예: s:5:"1.0.0")
+        if (preg_match('/^s:\d+:"(.*)"$/s', $raw, $m)) {
+            return $m[1];
+        }
+        return $raw;
     }
 
     /**
