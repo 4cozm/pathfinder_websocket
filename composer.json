@@ -12,7 +12,10 @@
     "autoload": {
         "psr-4": {
             "Exodus4D\\Socket\\": "app/"
-        }
+        },
+        "files": [
+            "ide-stubs/Cache.php"
+        ]
     },
     "require": {
         "php-64bit": ">=7.1",
