@@ -462,44 +462,32 @@ class MapUpdate extends AbstractMessageComponent
                 $dir = '/var/www/html/pathfinder/tmp/pf';
                 if (!is_dir($dir)) @mkdir($dir, 0775, true);
 
+                $resourceId = $conn->resourceId;
                 $presence = [
-                    'mapId' => $mapId,
-                    'ts'    => time(),
-                    'ttl'   => 120,               // heartbeat TTL과 동일하게
-                    'chars' => array_values($desired),
+                    'mapId'      => $mapId,
+                    'ts'         => time(),
+                    'ttl'        => 120,
+                    'chars'      => array_values($desired),
+                    'sourceConn' => $resourceId,
                 ];
 
-                // atomic write
-                $tmp = $dir . "/standalone_presence_map_{$mapId}.json.tmp";
-                $dst = $dir . "/standalone_presence_map_{$mapId}.json";
+                // per-conn atomic write: 같은 mapId의 다른 helper가 서로 덮어쓰지 않는다
+                $tmp = $dir . "/standalone_presence_map_{$mapId}_conn_{$resourceId}.json.tmp";
+                $dst = $dir . "/standalone_presence_map_{$mapId}_conn_{$resourceId}.json";
                 @file_put_contents($tmp, json_encode($presence), LOCK_EX);
                 @rename($tmp, $dst);
 
-                // REMOVE: 이번 heartbeat에 없는 캐릭터는 "이 conn"에서만 분리
+                // REMOVE: 이번 heartbeat에 없는 캐릭터는 "이 conn"에서만 분리.
+                // 다른 conn이 같은 character를 쓰는 경우 subscriptions는 유지된다.
                 foreach ($toRemove as $cid) {
                     $cid = (int)$cid;
 
-                    if (isset($this->characters[$cid][$conn->resourceId])) {
-                        unset($this->characters[$cid][$conn->resourceId]);
-                    }
+                    // 만료 테이블에서 제거 (이번 스냅샷에 없음)
+                    unset($conn->standalonePresenceExp[$cid]);
 
-                    // 만료 테이블에서도 제거(이번 틱에 없다는 건 "현재 스냅샷에 없다"는 뜻)
-                    if (isset($conn->standalonePresenceExp[$cid])) {
-                        unset($conn->standalonePresenceExp[$cid]);
-                    }
-
-                    // 완전 고아일 때만 해당 mapId 구독자에서 제거
-                    if (empty($this->characters[$cid])) {
-                        unset($this->characters[$cid]);
-
-                        if (isset($this->subscriptions[$mapId]['characterIds'][$cid])) {
-                            unset($this->subscriptions[$mapId]['characterIds'][$cid]);
-                        }
-
-                        // ⚠️ presence-only 정책:
-                        // characterData 삭제는 하지 않는다. (cron/ESI가 채운 log를 같이 날릴 수 있음)
-                        // $this->deleteCharacterData($cid);
-                    }
+                    // presence-only 정책: characterData는 건드리지 않는다.
+                    // cron/ESI가 채운 log를 같이 날리면 안 되므로 $cleanCache = false.
+                    $this->detachConnFromCharacter($cid, $conn, false);
                 }
 
                 // ADD: 이번 heartbeat 캐릭터들은 이 conn을 active connection처럼 공유 등록 + mapId 구독자에 올림
@@ -740,40 +728,30 @@ class MapUpdate extends AbstractMessageComponent
     private function unSubscribeCharacterId(int $characterId, ?ConnectionInterface $conn = null): bool
     {
         if ($characterId) {
-            // unSub from $this->characters ---------------------------------------------------------------------------
             if ($conn) {
-                // just unSub a specific connection (e.g. single browser window)
-                unset($this->characters[$characterId][$conn->resourceId]);
-
-                if (!count($this->characters[$characterId])) {
-                    // no connection left for this character
-                    unset($this->characters[$characterId]);
-                }
-                // TODO unset $this->>$characterData if $characterId does not have any other map subscribed to
+                // 특정 conn만 분리 — 공통 helper 사용.
+                // 다른 conn이 같은 characterId를 쓰는 경우 subscriptions는 그대로 유지된다.
+                $changedSubscriptionsMapIds = $this->detachConnFromCharacter($characterId, $conn);
             } else {
-                // unSub ALL connections from a character (e.g. multiple browsers)
+                // 모든 conn에서 분리 (e.g. 전체 로그아웃)
                 unset($this->characters[$characterId]);
-
-                // unset characterData cache
                 $this->deleteCharacterData($characterId);
-            }
 
-            // unSub from $this->subscriptions ------------------------------------------------------------------------
-            $changedSubscriptionsMapIds = [];
-            foreach ($this->subscriptions as $mapId => $subData) {
-                if (array_key_exists($characterId, (array)$subData['characterIds'])) {
-                    unset($this->subscriptions[$mapId]['characterIds'][$characterId]);
+                $changedSubscriptionsMapIds = [];
+                foreach ($this->subscriptions as $mapId => $subData) {
+                    if (array_key_exists($characterId, (array)$subData['characterIds'])) {
+                        unset($this->subscriptions[$mapId]['characterIds'][$characterId]);
 
-                    if (!count($this->subscriptions[$mapId]['characterIds'])) {
-                        // no characters left on this map
-                        unset($this->subscriptions[$mapId]);
+                        if (!count($this->subscriptions[$mapId]['characterIds'])) {
+                            unset($this->subscriptions[$mapId]);
+                        }
+
+                        $changedSubscriptionsMapIds[] = $mapId;
                     }
-
-                    $changedSubscriptionsMapIds[] = $mapId;
                 }
-            }
 
-            sort($changedSubscriptionsMapIds, SORT_NUMERIC);
+                sort($changedSubscriptionsMapIds, SORT_NUMERIC);
+            }
 
             $this->log(
                 ['debug', 'info'],
@@ -782,7 +760,6 @@ class MapUpdate extends AbstractMessageComponent
                 sprintf(static::LOG_TEXT_UNSUBSCRIBE, $characterId, implode(',', $changedSubscriptionsMapIds))
             );
 
-            // broadcast all active subscriptions to subscribed connections -------------------------------------------
             $this->broadcastMapSubscriptions($changedSubscriptionsMapIds);
         }
 
@@ -1165,6 +1142,56 @@ class MapUpdate extends AbstractMessageComponent
     private function deleteCharacterData(int $characterId): void
     {
         unset($this->characterData[$characterId]);
+    }
+
+    /**
+     * 단일 conn에서 characterId를 분리하는 공통 helper.
+     * - characters[$characterId]에서 해당 conn만 제거한다.
+     * - 해당 characterId에 연결된 conn이 0개가 됐을 때만
+     *   characters[$characterId] 자체와 subscriptions의 해당 항목을 제거한다.
+     * - subscriptions에서 제거된 mapId 목록을 반환한다(broadcastMapSubscriptions 호출 여부는 호출측 결정).
+     *
+     * @param int                          $characterId
+     * @param \Ratchet\ConnectionInterface $conn
+     * @param bool                         $cleanCache  true: orphan 시 characterData 캐시도 삭제.
+     *                                                  standalone presence-only 경로에서는 false를 넘겨
+     *                                                  cron/ESI가 채운 log 데이터를 보호한다.
+     * @return int[]  변경된 mapId 목록
+     */
+    private function detachConnFromCharacter(int $characterId, ConnectionInterface $conn, bool $cleanCache = true): array
+    {
+        if (!$characterId) return [];
+
+        // 이 conn만 제거
+        unset($this->characters[$characterId][$conn->resourceId]);
+
+        // 아직 다른 conn이 남아 있으면 subscriptions 건드리지 않음
+        if (!empty($this->characters[$characterId])) {
+            return [];
+        }
+
+        // conn이 하나도 없을 때만 완전 정리
+        unset($this->characters[$characterId]);
+
+        if ($cleanCache) {
+            $this->deleteCharacterData($characterId);
+        }
+
+        $changedMapIds = [];
+        foreach ($this->subscriptions as $mapId => $subData) {
+            if (array_key_exists($characterId, (array)$subData['characterIds'])) {
+                unset($this->subscriptions[$mapId]['characterIds'][$characterId]);
+
+                if (!count($this->subscriptions[$mapId]['characterIds'])) {
+                    unset($this->subscriptions[$mapId]);
+                }
+
+                $changedMapIds[] = $mapId;
+            }
+        }
+
+        sort($changedMapIds, SORT_NUMERIC);
+        return $changedMapIds;
     }
 
     /**
@@ -1693,22 +1720,24 @@ class MapUpdate extends AbstractMessageComponent
 
         if (empty($expired)) return;
 
+        $changedMapIds = [];
         foreach ($expired as $cid) {
-            // connection 레벨로 제거
-            if (isset($this->characters[$cid][$conn->resourceId])) {
-                unset($this->characters[$cid][$conn->resourceId]);
-            }
-
-            // 구독자에서도 제거
-            if (isset($this->subscriptions[$mapId]['characterIds'][$cid])) {
-                unset($this->subscriptions[$mapId]['characterIds'][$cid]);
-            }
-
+            // presence-only 정책: characterData는 건드리지 않는다 ($cleanCache = false)
+            $changed = $this->detachConnFromCharacter($cid, $conn, false);
+            $changedMapIds = array_merge($changedMapIds, $changed);
             unset($conn->standalonePresenceExp[$cid]);
         }
 
-        // UI 갱신
-        $this->broadcastMapSubscriptions([$mapId]);
+        // 만료된 per-conn presence 파일도 정리
+        $dir = '/var/www/html/pathfinder/tmp/pf';
+        $presenceFile = $dir . "/standalone_presence_map_{$mapId}_conn_{$conn->resourceId}.json";
+        if (file_exists($presenceFile)) {
+            @unlink($presenceFile);
+        }
+
+        if (!empty($changedMapIds)) {
+            $this->broadcastMapSubscriptions(array_unique($changedMapIds));
+        }
     }
 
     private function standaloneJwkThumbprint(array $jwk): string
