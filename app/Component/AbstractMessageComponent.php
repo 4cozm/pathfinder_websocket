@@ -36,11 +36,11 @@ abstract class AbstractMessageComponent implements MessageComponentInterface {
      * [
      *      '$conn1->resourceId' => [
      *          'connection' => $conn1,
-     *          'data' => null
+     *          'data' => []
      *      ],
      *      '$conn2->resourceId' => [
      *          'connection' => $conn2,
-     *          'data' => null
+     *          'data' => []
      *      ]
      * ]
      * @var array
@@ -118,6 +118,7 @@ abstract class AbstractMessageComponent implements MessageComponentInterface {
     private function addConnection(ConnectionInterface $conn) : void {
         $this->connections[$conn->resourceId] = [
             'connection' => $conn,
+            'data' => [],
         ];
 
         $this->maxConnections = max(count($this->connections), $this->maxConnections);

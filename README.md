@@ -1,5 +1,7 @@
 ## WebSocket server for [Pathfinder](https://github.com/exodus4d/pathfinder)
 
+**Note (PHP 8+):** New connections initialize per-connection `data` in `AbstractMessageComponent`, and map/character access checks guard missing keys so runtime logs avoid common `Undefined array key` warnings.
+
 ### Requirements
 - _PHP_ (≥ v7.1)
 - A working instance of *[Pathfinder](https://github.com/exodus4d/pathfinder)* (≥ v2.0.0-rc.1)

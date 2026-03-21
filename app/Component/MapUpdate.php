@@ -903,10 +903,15 @@ class MapUpdate extends AbstractMessageComponent
     private function checkCharacterAccess(int $characterId, string $characterToken): array
     {
         $characterData = [];
-        if (!empty($characterAccessData = (array)$this->characterAccessData[$characterId])) {
+        $characterAccessData = (array)($this->characterAccessData[$characterId] ?? []);
+        if (!empty($characterAccessData)) {
             // check expire for $this->characterAccessData -> check ALL characters and remove expired
             foreach ($characterAccessData as $i => $data) {
                 $deleteToken = false;
+
+                if (!is_array($data)) {
+                    continue;
+                }
 
                 if (((int)$data['expire'] - time()) > 0) {
                     // still valid -> check token
@@ -943,10 +948,17 @@ class MapUpdate extends AbstractMessageComponent
     private function checkMapAccess(int $characterId, int $mapId, string $mapToken): bool
     {
         $access = false;
-        if (!empty($mapAccessData = (array)$this->mapAccessData[$mapId][$characterId])) {
+        $mapAccessData = [];
+        if (isset($this->mapAccessData[$mapId][$characterId])) {
+            $mapAccessData = (array)$this->mapAccessData[$mapId][$characterId];
+        }
+        if (!empty($mapAccessData)) {
             foreach ($mapAccessData as $i => $data) {
                 $deleteToken = false;
                 // check expire for $this->mapAccessData -> check ALL characters and remove expired
+                if (!is_array($data)) {
+                    continue;
+                }
                 if (((int)$data['expire'] - time()) > 0) {
                     // still valid -> check token
                     if ($mapToken === $data['token']) {
