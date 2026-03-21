@@ -2,6 +2,8 @@
 
 **Note (PHP 8+):** New connections initialize per-connection `data` in `AbstractMessageComponent`, and map/character access checks guard missing keys so runtime logs avoid common `Undefined array key` warnings.
 
+**Map access (browser clients):** `mapConnectionAccess` / map access tokens issued from Pathfinder expire after **300 seconds** by default (`MapUpdate::$mapAccessExpireSeconds`). The browser map page refreshes tokens on each WebSocket `open` before `subscribe`. TCP `mapAccess` updates merge subscriptions for characters that still have an active connection even if character metadata cache is not populated yet.
+
 ### Requirements
 - _PHP_ (≥ v7.1)
 - A working instance of *[Pathfinder](https://github.com/exodus4d/pathfinder)* (≥ v2.0.0-rc.1)

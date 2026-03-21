@@ -76,7 +76,7 @@ class MapUpdate extends AbstractMessageComponent
      * expire time for map access tokens (seconds)
      * @var int
      */
-    protected $mapAccessExpireSeconds = 30;
+    protected $mapAccessExpireSeconds = 300;
 
     /**
      * character access tokens for clients
@@ -1288,12 +1288,8 @@ class MapUpdate extends AbstractMessageComponent
             $characterIds = (array)$accessData['characterIds'];
             // check all charactersIds that have map access... --------------------------------------------------------
             foreach ($characterIds as $characterId) {
-                // ... for at least ONE active connection ...
-                // ... and characterData cache exists for characterId
-                if (
-                    !empty($this->characters[$characterId]) &&
-                    !empty($this->getCharacterData($characterId))
-                ) {
+                // ... for at least ONE active connection (characterData may arrive later via TCP characterUpdate)
+                if (!empty($this->characters[$characterId])) {
                     $newMapCharacterIds[$characterId] = $characterId;
                 }
             }
