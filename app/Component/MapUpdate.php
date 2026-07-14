@@ -114,6 +114,15 @@ class MapUpdate extends AbstractMessageComponent
     protected $mapAccessData;
 
     /**
+     * SECURITY (F2-ws-heartbeat-idor): short-lived cache for DB-backed standalone map-access checks.
+     * Keyed by "characterId:mapId" => ['allow' => bool, 'exp' => unixTs]. Heartbeats recur frequently,
+     * so a brief positive/negative cache avoids hammering the DB. Only results of a SUCCESSFUL DB query
+     * are cached — fail-closed DB errors are never cached (so a transient outage cannot pin a denial).
+     * @var array
+     */
+    protected $standaloneMapAccessCache;
+
+    /**
      * connected characters
      * [
      *      'charId_1' => [
@@ -174,6 +183,7 @@ class MapUpdate extends AbstractMessageComponent
 
         $this->characterAccessData  = [];
         $this->mapAccessData        = [];
+        $this->standaloneMapAccessCache = [];
         $this->characters           = [];
         $this->subscriptions        = [];
         $this->characterData        = [];
@@ -385,6 +395,23 @@ class MapUpdate extends AbstractMessageComponent
                         'type' => 'standalone.ack',
                         'ok'   => false,
                         'code' => 'missing_mapId',
+                    ]);
+                    break;
+                }
+
+                // SECURITY (F2-ws-heartbeat-idor): authorize the bound character for this mapId against
+                // its REAL map membership in the DB (private character_map / corp corporation_map /
+                // alliance alliance_map — mirrors the main app's MapModel::hasAccess / CharacterModel::getMaps).
+                // The client-supplied mapId is untrusted; without this a standalone client could
+                // register/subscribe presence into ANY map its character has no access to. This does NOT
+                // depend on the ephemeral $this->mapAccessData token whitelist (never populated for
+                // standalone-bound characters); DB errors FAIL CLOSED (reject).
+                if (!$this->standaloneCharacterHasMapAccess((int)$conn->standaloneCid, $mapId)) {
+                    $this->wsSendJson($conn, [
+                        'type'  => 'standalone.ack',
+                        'ok'    => false,
+                        'code'  => 'map_forbidden',
+                        'mapId' => $mapId,
                     ]);
                     break;
                 }
@@ -984,6 +1011,82 @@ class MapUpdate extends AbstractMessageComponent
             }
         }
         return $access;
+    }
+
+    /**
+     * SECURITY (F2-ws-heartbeat-idor): read-only DB membership check for the standalone heartbeat path.
+     * Returns true iff $characterId genuinely has access to the ACTIVE map $mapId via any of:
+     *   - private map:  a character_map row (characterId, mapId, active=1)
+     *   - corp map:     a corporation_map row (mapId, active=1) matching the character's corporationId
+     *   - alliance map: an alliance_map row (mapId, active=1) matching the character's allianceId
+     *   - the default shared map (id 3), which the main app auto-grants to every character in
+     *     CharacterModel::getMaps() — included so legit standalone clients on the default map keep working.
+     * This mirrors the authority the main app uses (MapModel::hasAccess -> CharacterModel::getMaps) and,
+     * unlike checkMapAccess(), does NOT depend on the ephemeral one-time $this->mapAccessData token
+     * whitelist (which is never populated for standalone-bound characters). DB/config errors FAIL CLOSED.
+     * @param int $characterId
+     * @param int $mapId
+     * @return bool
+     */
+    private function standaloneCharacterHasMapAccess(int $characterId, int $mapId): bool
+    {
+        if ($characterId <= 0 || $mapId <= 0) {
+            return false;
+        }
+
+        // brief per-(character,map) cache — heartbeats recur, avoid hammering the DB
+        $cacheKey = $characterId . ':' . $mapId;
+        if (isset($this->standaloneMapAccessCache[$cacheKey])) {
+            $cached = $this->standaloneMapAccessCache[$cacheKey];
+            if (is_array($cached) && (int)$cached['exp'] > time()) {
+                return (bool)$cached['allow'];
+            }
+            unset($this->standaloneMapAccessCache[$cacheKey]);
+        }
+
+        $host = getenv('MYSQL_HOST');
+        $dbname = getenv('MYSQL_PF_DB_NAME');
+        $user = getenv('MYSQL_USER');
+        $pass = getenv('MYSQL_PASSWORD');
+        $port = getenv('MYSQL_PORT') ?: '3306';
+        if (!is_string($host) || $host === '' || !is_string($dbname) || $dbname === '') {
+            // FAIL CLOSED: cannot verify membership without DB config
+            error_log('[WS] standalone map-access check skipped (FAIL CLOSED): MYSQL_HOST or MYSQL_PF_DB_NAME empty');
+            return false;
+        }
+
+        try {
+            $dsn = sprintf('mysql:host=%s;port=%s;dbname=%s;charset=utf8mb4', $host, $port, $dbname);
+            $pdo = new \PDO($dsn, (string)$user, (string)$pass, [
+                \PDO::ATTR_ERRMODE => \PDO::ERRMODE_EXCEPTION,
+            ]);
+            // Single parameterized existence check. Each placeholder appears exactly once.
+            // The map must be active; membership is derived from the character's own corp/alliance
+            // columns so a client cannot spoof corp/alliance affiliation.
+            $sql =
+                'SELECT 1 ' .
+                'FROM `character` c ' .
+                'JOIN `map` m ON m.id = :mapId AND m.active = 1 ' .
+                'WHERE c.id = :cid AND ( ' .
+                '    m.id = 3 ' .
+                '    OR EXISTS (SELECT 1 FROM `character_map` cm WHERE cm.mapId = m.id AND cm.characterId = c.id AND cm.active = 1) ' .
+                '    OR (c.corporationId IS NOT NULL AND c.corporationId > 0 AND EXISTS (' .
+                '        SELECT 1 FROM `corporation_map` com WHERE com.mapId = m.id AND com.corporationId = c.corporationId AND com.active = 1)) ' .
+                '    OR (c.allianceId IS NOT NULL AND c.allianceId > 0 AND EXISTS (' .
+                '        SELECT 1 FROM `alliance_map` am WHERE am.mapId = m.id AND am.allianceId = c.allianceId AND am.active = 1)) ' .
+                ') LIMIT 1';
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute([':mapId' => $mapId, ':cid' => $characterId]);
+            $allow = ($stmt->fetchColumn() !== false);
+
+            // cache only results of a SUCCESSFUL query (never cache fail-closed DB errors)
+            $this->standaloneMapAccessCache[$cacheKey] = ['allow' => $allow, 'exp' => time() + 60];
+            return $allow;
+        } catch (\Throwable $e) {
+            // SECURITY (F2-ws-heartbeat-idor): FAIL CLOSED on DB error — never allow on failure.
+            error_log('[WS] standalone map-access check failed (FAIL CLOSED): ' . $e->getMessage());
+            return false;
+        }
     }
 
     /**
@@ -1676,7 +1779,9 @@ class MapUpdate extends AbstractMessageComponent
             return $existing;
         } catch (\Throwable $e) {
             error_log('[WS] standalone check failed: ' . $e->getMessage());
-            return $validCids; // fallback to allow all
+            // SECURITY (F2-ws-heartbeat-idor): FAIL CLOSED on DB error — never allow-all.
+            // Returning $validCids here would let unverified client-supplied characterIds through.
+            return [];
         }
     }
 
