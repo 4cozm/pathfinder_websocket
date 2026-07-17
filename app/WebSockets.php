@@ -73,6 +73,16 @@ class WebSockets {
             $mapUpdate->housekeeping($timer);
         });
 
+        // 60초마다 접속/구독/메모리 스냅샷을 JSON 한 줄로 stderr에 남긴다
+        // (docker logs → Loki. mem_limit 200m 컨테이너의 OOM 추적 + 접속 churn 관측용)
+        $loop->addPeriodicTimer(60, function() use ($mapUpdate) {
+            try {
+                error_log('[ws-stats] ' . json_encode($mapUpdate->getMetricsSnapshot()));
+            } catch (\Throwable $e) {
+                error_log('[ws-stats] snapshot failed: ' . $e->getMessage());
+            }
+        });
+
         // TCP Socket -------------------------------------------------------------------------------------------------
         $tcpSocket = new TcpSocket($loop, $mapUpdate, $tcpSocketLogStore);
         // TCP Server (WebServer <-> TCPServer <-> TCPSocket communication)

@@ -1536,6 +1536,35 @@ class MapUpdate extends AbstractMessageComponent
     }
 
     /**
+     * compact machine-readable metrics snapshot for periodic stdout logging
+     * (per-connection detail is intentionally excluded → log volume/PII)
+     * @return array
+     */
+    public function getMetricsSnapshot() : array {
+        $subStats = $this->getSubscriptionStats();
+        $socketStats = $this->getSocketStats();
+
+        $channels = [];
+        foreach ((array)$subStats['channels'] as $channelStats) {
+            $channels[] = [
+                'mapId'     => $channelStats['channelId'],
+                'countSub'  => $channelStats['countSub'],
+                'countCon'  => $channelStats['countCon'],
+            ];
+        }
+
+        return [
+            'connections'       => $socketStats['connections'],
+            'maxConnections'    => $socketStats['maxConnections'],
+            'subscribers'       => $subStats['countSub'],
+            'subscribedCon'     => $subStats['countCon'],
+            'channels'          => $channels,
+            'memMb'             => (int)round(memory_get_usage(true) / 1048576),
+            'memPeakMb'         => (int)round(memory_get_peak_usage(true) / 1048576),
+        ];
+    }
+
+    /**
      * compare two assoc arrays by keys. Key order is ignored
      * -> if all keys from array1 exist in array2 && all keys from array2 exist in array 1, arrays are supposed to be equal
      * @param array $array1
