@@ -1135,6 +1135,16 @@ class MapUpdate extends AbstractMessageComponent
                 break;
             case 'mapUpdate':
                 $responseLoad = $this->broadcastMapUpdate($task, (array)$load);
+                // 맵 구조를 보낸 "직후" 유저 좌표('mapSubscriptions')를 재배달한다.
+                //
+                // 점프 처리 요청 안에서 characterUpdate(파일럿 좌표)가 mapUpdate(새 시스템)보다
+                // 먼저 나간다. 브라우저는 좌표를 먼저 받지만 그 시점엔 시스템 DOM 이 없어
+                // 버리고, 시스템이 그려진 뒤엔 아무도 좌표를 다시 밀어주지 않는다 → 파일럿이
+                // 다음 폴링/브로드캐스트까지(실측 ~1.5s) 안 보인다. 상류 설계부터 있던 공백.
+                //
+                // 여기서 재배달하면 순서가 보장된다. characterData 는 이미 메모리에 있으므로
+                // 추가 조회 없음, 맵 변경 1건당 프레임 1개 비용이 전부다.
+                $this->broadcastMapSubscriptions([(int)$load['config']['id']]);
                 break;
             case 'mapDeleted':
                 $responseLoad = $this->deleteMapId($task, (int)$load);
